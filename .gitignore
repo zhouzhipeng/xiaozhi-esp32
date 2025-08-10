@@ -5,7 +5,6 @@ build/
 .vscode/
 .devcontainer/
 sdkconfig.old
-sdkconfig
 dependencies.lock
 .env
 releases/
@@ -17,3 +16,6 @@ main/mmap_generate_emoji.h
 *.pyc
 *.bin
 mmap_generate_*.h
+esp-idf/
+cmake-build*
+.idea/

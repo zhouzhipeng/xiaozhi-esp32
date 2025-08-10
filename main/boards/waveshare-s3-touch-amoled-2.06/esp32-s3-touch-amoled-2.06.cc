@@ -119,8 +119,10 @@ public:
                         })
     {
         DisplayLockGuard lock(this);
-        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.1, 0);
-        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
+        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.15, 0);  // 增加到15%避免圆角遮挡
+        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.15, 0); // 增加到15%避免圆角遮挡
+        lv_obj_set_style_pad_top(status_bar_, 20, 0);  // 添加顶部边距让状态栏往下移
+        lv_obj_set_size(status_bar_, LV_HOR_RES, fonts_.text_font->line_height + 15); // 增加状态栏高度
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
     }
 };
