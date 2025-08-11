@@ -141,16 +141,22 @@ JSON object containing:
 ```
 
 ### 6. `self.sdcard.display_image`
-Displays a JPEG image file from the SD card on the screen.
+Displays an image file from the SD card on the screen. Supports multiple image formats.
+
+**Supported Formats:**
+- JPEG (.jpg, .jpeg) - Full hardware-accelerated decoding with automatic scaling
+- PNG (.png) - Displays placeholder with format notification (full support pending)
+- BMP (.bmp) - Basic support for 24-bit BMP files (in development)
 
 **Parameters:**
-- `filepath` (string, required): Full path of the JPEG image file
+- `filepath` (string, required): Full path of the image file
 
 **Returns:**
 JSON object containing:
 - `success`: Boolean indicating operation success
 - `message`: Status message
 - `filepath`: The image file path
+- `format`: Detected image format (JPEG/PNG/BMP/unknown)
 - `size`: File size in bytes
 
 **Example:**
@@ -248,7 +254,11 @@ Common error conditions:
 
 2. **Thread Safety**: MCP tool calls are executed in separate threads with configurable stack size (default: 6144 bytes).
 
-3. **Image Formats**: Currently only JPEG images are supported for display. Other formats may be read as binary/text data.
+3. **Image Formats**: 
+   - JPEG (.jpg, .jpeg): Fully supported with hardware acceleration and automatic scaling
+   - PNG (.png): Detected and handled, displays placeholder with notification (full decoder integration pending)
+   - BMP (.bmp): Basic 24-bit BMP support (development in progress)
+   - Other formats: Can be read as binary/text data but not displayed
 
 4. **Path Format**: All paths should use forward slashes (/) and start with `/sdcard`.
 

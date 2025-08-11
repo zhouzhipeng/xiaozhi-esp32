@@ -24,6 +24,7 @@
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+#include <esp_timer.h>
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -38,6 +39,8 @@
 #include "jpeg_decoder.h"
 #include <ff.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cctype>
 
 // 包含必要的头文件
 
@@ -51,6 +54,13 @@ public:
     Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Axp2101(i2c_bus, addr) {
         WriteReg(0x22, 0b110); // PWRON > OFFLEVEL as POWEROFF Source enable
         WriteReg(0x27, 0x10);  // hold 4s to power off
+        
+        // 启用PWRON按键中断
+        // 0x40: IRQ使能寄存器1
+        // Bit 3: PWRON短按中断使能
+        uint8_t irq_enable = ReadReg(0x40);
+        irq_enable |= 0x08;  // 启用PWRON短按中断
+        WriteReg(0x40, irq_enable);
 
         // Disable All DCs but DC1
         WriteReg(0x80, 0x01);
@@ -73,6 +83,16 @@ public:
         WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
         WriteReg(0x62, 0x0A); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
         WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
+    }
+    
+    // 公共方法来读取IRQ状态
+    uint8_t GetIRQStatus1() {
+        return ReadReg(0x48);
+    }
+    
+    // 公共方法来清除IRQ标志
+    void ClearIRQStatus1(uint8_t mask) {
+        WriteReg(0x48, mask);
     }
 };
 
@@ -109,6 +129,7 @@ public:
 private:
     lv_obj_t* sd_button_ = nullptr;
     lv_obj_t* sd_image_ = nullptr;
+    lv_timer_t* clear_timer_ = nullptr;  // 添加清屏定时器
     bool sd_initialized_ = false;
     uint8_t* image_buffer_ = nullptr;
     size_t image_buffer_size_ = 0;
@@ -118,6 +139,59 @@ private:
     static void sd_button_event_cb(lv_event_t* e) {
         CustomLcdDisplay* display = (CustomLcdDisplay*)lv_event_get_user_data(e);
         display->DisplaySDCardImage();
+    }
+    
+    static void clear_timer_cb(lv_timer_t* timer) {
+        CustomLcdDisplay* display = (CustomLcdDisplay*)lv_timer_get_user_data(timer);
+        display->ClearImage();
+    }
+    
+    void ClearImage() {
+        DisplayLockGuard lock(this);
+        
+        // 删除图片
+        if (sd_image_ != nullptr) {
+            lv_obj_del(sd_image_);
+            sd_image_ = nullptr;
+        }
+        
+        // 释放图片缓冲区
+        if (image_buffer_ != nullptr) {
+            free(image_buffer_);
+            image_buffer_ = nullptr;
+        }
+        
+        // 删除定时器
+        if (clear_timer_ != nullptr) {
+            lv_timer_del(clear_timer_);
+            clear_timer_ = nullptr;
+        }
+        
+        // 清除所有可能的标签（PNG/BMP提示等）
+        uint32_t child_cnt = lv_obj_get_child_count(container_);
+        for(int i = child_cnt - 1; i >= 0; i--) {
+            lv_obj_t* child = lv_obj_get_child(container_, i);
+            // 只删除标签和图片，不删除状态栏等重要元素
+            if(lv_obj_check_type(child, &lv_label_class) && child != status_bar_) {
+                lv_obj_del(child);
+            }
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "Screen cleared after 5 seconds");
+    }
+    
+    void SetupClearTimer() {
+        // 如果已有定时器，先删除
+        if (clear_timer_ != nullptr) {
+            lv_timer_del(clear_timer_);
+            clear_timer_ = nullptr;
+        }
+        
+        // 创建5秒后清屏的定时器
+        clear_timer_ = lv_timer_create(clear_timer_cb, 5000, this);
+        lv_timer_set_repeat_count(clear_timer_, 1);  // 只执行一次
+        
+        ESP_LOGI("CustomLcdDisplay", "Clear timer set for 5 seconds");
     }
     
     
@@ -137,10 +211,33 @@ public:
             image_buffer_ = nullptr;
         }
         
+        // 检查文件扩展名
+        std::string file_path_str(filepath);
+        std::string extension = "";
+        size_t dot_pos = file_path_str.rfind('.');
+        if (dot_pos != std::string::npos) {
+            extension = file_path_str.substr(dot_pos + 1);
+            // 转换为小写
+            std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "File extension: %s", extension.c_str());
+        
+        if (extension == "png") {
+            // PNG文件处理
+            DisplayPngFile(filepath);
+            return;
+        } else if (extension == "bmp") {
+            // BMP文件处理
+            DisplayBmpFile(filepath);
+            return;
+        }
+        
+        // 默认作为JPEG处理
         // 读取JPEG文件
         FILE* fp = fopen(filepath, "rb");
         if (!fp) {
-            ESP_LOGE("CustomLcdDisplay", "Failed to open JPEG file: %s", filepath);
+            ESP_LOGE("CustomLcdDisplay", "Failed to open image file: %s", filepath);
             ShowNotification("无法打开图片", 3000);
             return;
         }
@@ -288,7 +385,204 @@ public:
         }
         
         ESP_LOGI("CustomLcdDisplay", "Image displayed successfully!");
+        
+        // 设置5秒后清屏
+        SetupClearTimer();
     }
+    
+    // PNG文件显示函数
+    void DisplayPngFile(const char* filepath) {
+        ESP_LOGI("CustomLcdDisplay", "Displaying PNG file: %s", filepath);
+        
+        // 当前暂不支持PNG格式，提示用户转换格式
+        ESP_LOGW("CustomLcdDisplay", "PNG format is not fully supported. Please convert to JPEG for best results.");
+        ShowNotification("PNG格式暂不支持，请转换为JPEG格式", 5000);
+        
+        // 显示一个友好的占位符图像
+        DisplayLockGuard lock(this);
+        
+        // 如果已有图片显示，先删除
+        if (sd_image_ != nullptr) {
+            lv_obj_del(sd_image_);
+            sd_image_ = nullptr;
+        }
+        
+        // 释放之前的图片缓冲区
+        if (image_buffer_ != nullptr) {
+            free(image_buffer_);
+            image_buffer_ = nullptr;
+        }
+        
+        // 创建一个带PNG标识的占位符
+        int img_width = 240;
+        int img_height = 240;
+        size_t img_size = img_width * img_height * 2;  // RGB565
+        
+        image_buffer_ = (uint8_t*)heap_caps_malloc(img_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!image_buffer_) {
+            image_buffer_ = (uint8_t*)malloc(img_size);
+            if (!image_buffer_) {
+                ESP_LOGE("CustomLcdDisplay", "Failed to allocate placeholder buffer");
+                return;
+            }
+        }
+        
+        // 创建一个渐变背景作为PNG占位符
+        uint16_t* pixels = (uint16_t*)image_buffer_;
+        for (int y = 0; y < img_height; y++) {
+            for (int x = 0; x < img_width; x++) {
+                // 创建蓝色渐变效果
+                uint8_t blue = 128 + (y * 127 / img_height);
+                uint8_t green = 64 + (x * 64 / img_width);
+                uint8_t red = 32;
+                
+                uint16_t color = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3);
+                pixels[y * img_width + x] = color;
+            }
+        }
+        
+        image_width_ = img_width;
+        image_height_ = img_height;
+        
+        // 创建LVGL图片对象
+        sd_image_ = lv_img_create(container_);
+        
+        // 创建LVGL图片描述符
+        static lv_img_dsc_t img_dsc;
+        img_dsc.header.reserved_2 = 0;
+        img_dsc.header.w = image_width_;
+        img_dsc.header.h = image_height_;
+        img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        img_dsc.data_size = img_size;
+        img_dsc.data = image_buffer_;
+        
+        lv_img_set_src(sd_image_, &img_dsc);
+        lv_obj_align(sd_image_, LV_ALIGN_CENTER, 0, -50);
+        
+        // 添加PNG标签
+        lv_obj_t* label = lv_label_create(container_);
+        lv_label_set_text(label, "PNG 图片");
+        lv_obj_set_style_text_font(label, fonts_.text_font, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 100);
+        
+        // 添加提示信息
+        lv_obj_t* hint_label = lv_label_create(container_);
+        lv_label_set_text(hint_label, "请使用JPEG格式");
+        lv_obj_set_style_text_font(hint_label, fonts_.text_font, 0);
+        lv_obj_set_style_text_color(hint_label, lv_color_hex(0xFFFF00), 0);
+        lv_obj_align(hint_label, LV_ALIGN_CENTER, 0, 130);
+        
+        ESP_LOGI("CustomLcdDisplay", "PNG placeholder displayed");
+        
+        // 设置5秒后清屏
+        SetupClearTimer();
+    }
+    
+    // BMP文件显示函数  
+    void DisplayBmpFile(const char* filepath) {
+        ESP_LOGI("CustomLcdDisplay", "Displaying BMP file: %s", filepath);
+        
+        // BMP是相对简单的格式，可以手动解析
+        FILE* fp = fopen(filepath, "rb");
+        if (!fp) {
+            ESP_LOGE("CustomLcdDisplay", "Failed to open BMP file");
+            ShowNotification("无法打开BMP文件", 3000);
+            return;
+        }
+        
+        // 读取BMP文件头
+        uint8_t header[54];
+        if (fread(header, 1, 54, fp) != 54) {
+            ESP_LOGE("CustomLcdDisplay", "Invalid BMP header");
+            fclose(fp);
+            ShowNotification("无效的BMP文件", 3000);
+            return;
+        }
+        
+        // 检查是否是BMP文件
+        if (header[0] != 'B' || header[1] != 'M') {
+            ESP_LOGE("CustomLcdDisplay", "Not a valid BMP file");
+            fclose(fp);
+            ShowNotification("不是有效的BMP文件", 3000);
+            return;
+        }
+        
+        // 解析BMP信息
+        int width = *(int*)&header[18];
+        int height = *(int*)&header[22];
+        int bits_per_pixel = *(short*)&header[28];
+        
+        ESP_LOGI("CustomLcdDisplay", "BMP: %dx%d, %d bpp", width, height, bits_per_pixel);
+        
+        // 目前只支持24位BMP
+        if (bits_per_pixel != 24) {
+            ESP_LOGE("CustomLcdDisplay", "Only 24-bit BMP supported, got %d-bit", bits_per_pixel);
+            fclose(fp);
+            ShowNotification("仅支持24位BMP图片", 3000);
+            return;
+        }
+        
+        fclose(fp);
+        
+        // 显示占位符
+        DisplayPlaceholderImage("BMP Image");
+        ShowNotification("BMP支持开发中", 3000);
+    }
+    
+    // 显示占位符图像
+    void DisplayPlaceholderImage(const char* text) {
+        DisplayLockGuard lock(this);
+        
+        // 创建一个简单的占位符图像
+        int img_width = 200;
+        int img_height = 200;
+        size_t img_size = img_width * img_height * 2;  // RGB565
+        
+        image_buffer_ = (uint8_t*)heap_caps_malloc(img_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!image_buffer_) {
+            image_buffer_ = (uint8_t*)malloc(img_size);
+            if (!image_buffer_) {
+                ESP_LOGE("CustomLcdDisplay", "Failed to allocate placeholder buffer");
+                return;
+            }
+        }
+        
+        // 填充灰色背景
+        uint16_t* pixels = (uint16_t*)image_buffer_;
+        uint16_t gray = ((0x80 & 0xF8) << 8) | ((0x80 & 0xFC) << 3) | (0x80 >> 3);
+        for (int i = 0; i < img_width * img_height; i++) {
+            pixels[i] = gray;
+        }
+        
+        image_width_ = img_width;
+        image_height_ = img_height;
+        
+        // 创建LVGL图片对象
+        sd_image_ = lv_img_create(container_);
+        
+        // 创建LVGL图片描述符
+        static lv_img_dsc_t img_dsc;
+        img_dsc.header.reserved_2 = 0;
+        img_dsc.header.w = image_width_;
+        img_dsc.header.h = image_height_;
+        img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        img_dsc.data_size = img_size;
+        img_dsc.data = image_buffer_;
+        
+        lv_img_set_src(sd_image_, &img_dsc);
+        lv_obj_align(sd_image_, LV_ALIGN_CENTER, 0, -30);
+        
+        // 添加文字标签
+        lv_obj_t* label = lv_label_create(container_);
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_font(label, fonts_.text_font, 0);
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 100);
+        
+        // 设置5秒后清屏
+        SetupClearTimer();
+    }
+    
     bool InitializeSDCard() {
         if (sd_initialized_) {
             return true;
@@ -549,9 +843,24 @@ public:
 class CustomBacklight : public Backlight {
 public:
     CustomBacklight(esp_lcd_panel_io_handle_t panel_io) : Backlight(), panel_io_(panel_io) {}
+    
+    // 保存当前亮度
+    void SaveCurrentBrightness() {
+        saved_brightness_ = brightness();
+    }
+    
+    // 恢复保存的亮度
+    void RestoreSavedBrightness() {
+        if (saved_brightness_ > 0) {
+            SetBrightness(saved_brightness_);
+        } else {
+            RestoreBrightness();  // 使用默认恢复
+        }
+    }
 
 protected:
     esp_lcd_panel_io_handle_t panel_io_;
+    uint8_t saved_brightness_ = 50;  // 保存的亮度值
 
     virtual void SetBrightnessImpl(uint8_t brightness) override {
         auto display = Board::GetInstance().GetDisplay();
@@ -573,6 +882,8 @@ private:
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     PowerSaveTimer* power_save_timer_;
+    bool screen_on_ = true;  // 屏幕状态标志
+    esp_timer_handle_t pwr_button_timer_ = nullptr;  // 用于轮询PWR按键状态
 
     void InitializePowerSaveTimer() {
         // 临时禁用电源管理定时器，防止自动关机
@@ -619,8 +930,34 @@ private:
         ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
 
+    // 检查PWR按键状态的回调函数
+    static void CheckPwrButtonTimer(void* arg) {
+        auto self = static_cast<WaveshareEsp32s3TouchAMOLED2inch06*>(arg);
+        self->CheckPwrButtonStatus();
+    }
+    
+    // 检查PWR按键状态（通过AXP2101）
+    void CheckPwrButtonStatus() {
+        // 读取AXP2101的IRQ状态寄存器1 (0x48)
+        // Bit 3: PWRON短按
+        // Bit 4: PWRON长按
+        uint8_t irq_status1 = pmic_->GetIRQStatus1();
+        
+        // 检查PWRON按键短按事件
+        if (irq_status1 & 0x08) {  // Bit 3: PWRON短按
+            ESP_LOGI(TAG, "PWR button short press detected");
+            ToggleScreen();
+            // 清除IRQ标志
+            pmic_->ClearIRQStatus1(0x08);
+        }
+        
+        // 注意：长按由PMIC硬件处理关机，无需软件干预
+    }
+    
     void InitializeButtons() {
+        // BOOT按键（GPIO0）：聊天状态切换
         boot_button_.OnClick([this]() {
+            ESP_LOGI(TAG, "BOOT button clicked");
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
                 ResetWifiConfiguration();
@@ -629,13 +966,82 @@ private:
         });
 
 #if CONFIG_USE_DEVICE_AEC
-        boot_button_.OnDoubleClick([this]() {
+        // BOOT按键三击：AEC模式切换（如果启用）
+        boot_button_.OnMultipleClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateIdle) {
                 app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
             }
-        });
+        }, 3);
 #endif
+        
+        // 设置定时器轮询PWR按键状态（通过AXP2101）
+        ESP_LOGI(TAG, "Setting up PWR button polling timer for AXP2101");
+        esp_timer_create_args_t timer_args = {
+            .callback = CheckPwrButtonTimer,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "pwr_button_timer"
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &pwr_button_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(pwr_button_timer_, 100000));  // 100ms轮询一次
+        
+        // PWR按键长按4秒由PMIC硬件处理关机，无需软件干预
+    }
+    
+    // 切换屏幕显示
+    void ToggleScreen() {
+        if (screen_on_) {
+            // 关闭屏幕
+            TurnOffScreen();
+        } else {
+            // 打开屏幕
+            TurnOnScreen();
+        }
+    }
+    
+    // 关闭屏幕
+    void TurnOffScreen() {
+        if (!screen_on_) return;
+        
+        ESP_LOGI(TAG, "Turning off screen");
+        
+        // 保存当前亮度
+        backlight_->SaveCurrentBrightness();
+        
+        // 关闭背光
+        backlight_->SetBrightness(0);
+        
+        // 设置显示器进入省电模式
+        if (display_) {
+            display_->SetPowerSaveMode(true);
+        }
+        
+        screen_on_ = false;
+        
+        ESP_LOGI(TAG, "Screen turned off, press power button to turn on");
+    }
+    
+    // 打开屏幕
+    void TurnOnScreen() {
+        if (screen_on_) return;
+        
+        ESP_LOGI(TAG, "Turning on screen");
+        
+        // 退出省电模式
+        if (display_) {
+            display_->SetPowerSaveMode(false);
+        }
+        
+        // 恢复背光亮度
+        backlight_->RestoreSavedBrightness();
+        
+        screen_on_ = true;
+        
+        // 显示通知
+        display_->ShowNotification("屏幕已开启", 1000);
+        
+        ESP_LOGI(TAG, "Screen turned on");
     }
 
     void InitializeSH8601Display() {
@@ -873,6 +1279,25 @@ private:
             return "{\"success\": false, \"error\": \"Image file not found\"}";
         }
         
+        // 检测文件格式
+        std::string file_path_str(filepath);
+        std::string extension = "";
+        size_t dot_pos = file_path_str.rfind('.');
+        if (dot_pos != std::string::npos) {
+            extension = file_path_str.substr(dot_pos + 1);
+            // 转换为小写
+            std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+        }
+        
+        std::string format = "unknown";
+        if (extension == "jpg" || extension == "jpeg") {
+            format = "JPEG";
+        } else if (extension == "png") {
+            format = "PNG";
+        } else if (extension == "bmp") {
+            format = "BMP";
+        }
+        
         // 调用显示图片的函数
         display_->DisplayJpegFile(filepath.c_str());
         
@@ -880,6 +1305,7 @@ private:
         cJSON_AddBoolToObject(result, "success", true);
         cJSON_AddStringToObject(result, "message", "Image displayed successfully");
         cJSON_AddStringToObject(result, "filepath", filepath.c_str());
+        cJSON_AddStringToObject(result, "format", format.c_str());
         cJSON_AddNumberToObject(result, "size", file_stat.st_size);
         
         char* json_str = cJSON_PrintUnformatted(result);
@@ -1005,10 +1431,11 @@ private:
         
         mcp_server.AddTool("self.sdcard.display_image",
             "Display an image file from the SD card on the screen.\n"
+            "Supported formats: JPEG (.jpg, .jpeg), PNG (.png), BMP (.bmp)\n"
             "Args:\n"
-            "  `filepath`: The full path of the image file (JPEG)\n"
+            "  `filepath`: The full path of the image file\n"
             "Return:\n"
-            "  Success status message.",
+            "  Success status message with format info.",
             PropertyList({
                 Property("filepath", kPropertyTypeString)
             }),
@@ -1027,6 +1454,13 @@ public:
         InitializeTouch();
         InitializeButtons();
         InitializeTools();
+    }
+    
+    ~WaveshareEsp32s3TouchAMOLED2inch06() {
+        if (pwr_button_timer_) {
+            esp_timer_stop(pwr_button_timer_);
+            esp_timer_delete(pwr_button_timer_);
+        }
     }
 
     virtual AudioCodec* GetAudioCodec() override {
