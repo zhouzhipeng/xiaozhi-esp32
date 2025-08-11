@@ -18,11 +18,28 @@
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_master.h>
+#include <driver/gpio.h>
 #include "settings.h"
 
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+
+#include <dirent.h>
+#include <sys/stat.h>
+#include <string>
+#include <errno.h>
+#include <string.h>
+#include <esp_vfs_fat.h>
+#include <driver/sdspi_host.h>
+#include <driver/spi_common.h>
+#include <sdmmc_cmd.h>
+#include <esp_rom_sys.h>
+#include "jpeg_decoder.h"
+#include <ff.h>
+#include <unistd.h>
+
+// 包含必要的头文件
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
 
@@ -78,8 +95,393 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
     {0x51, (uint8_t []){0xFF}, 1, 0},
 };
 
+// SD卡GPIO配置
+#define SD_MOSI_PIN GPIO_NUM_1
+#define SD_MISO_PIN GPIO_NUM_3
+#define SD_SCK_PIN  GPIO_NUM_2
+#define SD_CS_PIN   GPIO_NUM_17
+
 // 在waveshare_amoled_2_06类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
+public:
+    sdmmc_card_t* sd_card_ = nullptr;
+    
+private:
+    lv_obj_t* sd_button_ = nullptr;
+    lv_obj_t* sd_image_ = nullptr;
+    bool sd_initialized_ = false;
+    uint8_t* image_buffer_ = nullptr;
+    size_t image_buffer_size_ = 0;
+    int image_width_ = 0;
+    int image_height_ = 0;
+    
+    static void sd_button_event_cb(lv_event_t* e) {
+        CustomLcdDisplay* display = (CustomLcdDisplay*)lv_event_get_user_data(e);
+        display->DisplaySDCardImage();
+    }
+    
+    
+public:
+    void DisplayJpegFile(const char* filepath) {
+        DisplayLockGuard lock(this);
+        
+        // 如果已有图片显示，先删除
+        if (sd_image_ != nullptr) {
+            lv_obj_del(sd_image_);
+            sd_image_ = nullptr;
+        }
+        
+        // 释放之前的图片缓冲区
+        if (image_buffer_ != nullptr) {
+            free(image_buffer_);
+            image_buffer_ = nullptr;
+        }
+        
+        // 读取JPEG文件
+        FILE* fp = fopen(filepath, "rb");
+        if (!fp) {
+            ESP_LOGE("CustomLcdDisplay", "Failed to open JPEG file: %s", filepath);
+            ShowNotification("无法打开图片", 3000);
+            return;
+        }
+        
+        // 获取文件大小
+        fseek(fp, 0, SEEK_END);
+        long file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        
+        ESP_LOGI("CustomLcdDisplay", "JPEG file size: %ld bytes", file_size);
+        
+        // 限制读取大小，防止内存不足（最多500KB用于JPEG数据）
+        size_t read_size = (file_size > 512000) ? 512000 : file_size;
+        
+        // 分配JPEG数据缓冲区
+        uint8_t* jpeg_data = (uint8_t*)heap_caps_malloc(read_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!jpeg_data) {
+            jpeg_data = (uint8_t*)malloc(read_size);
+            if (!jpeg_data) {
+                ESP_LOGE("CustomLcdDisplay", "Failed to allocate JPEG buffer");
+                fclose(fp);
+                ShowNotification("内存不足", 3000);
+                return;
+            }
+        }
+        
+        // 读取JPEG数据
+        size_t bytes_read = fread(jpeg_data, 1, read_size, fp);
+        fclose(fp);
+        
+        if (bytes_read == 0) {
+            ESP_LOGE("CustomLcdDisplay", "Failed to read JPEG data");
+            free(jpeg_data);
+            ShowNotification("读取图片失败", 3000);
+            return;
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "Read %d bytes of JPEG data", bytes_read);
+        
+        // 首先获取图片信息来决定缩放比例
+        esp_jpeg_image_cfg_t jpeg_cfg = {};
+        jpeg_cfg.indata = jpeg_data;
+        jpeg_cfg.indata_size = bytes_read;
+        jpeg_cfg.out_format = JPEG_IMAGE_FORMAT_RGB565;
+        jpeg_cfg.out_scale = JPEG_IMAGE_SCALE_0;  // 先不缩放获取原始尺寸
+        
+        esp_jpeg_image_output_t img_info = {};
+        esp_err_t ret = esp_jpeg_get_image_info(&jpeg_cfg, &img_info);
+        
+        if (ret != ESP_OK) {
+            ESP_LOGE("CustomLcdDisplay", "Failed to get JPEG info: %s", esp_err_to_name(ret));
+            free(jpeg_data);
+            ShowNotification("解析图片失败", 3000);
+            return;
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "Original image size: %dx%d", img_info.width, img_info.height);
+        
+        // 根据图片大小决定缩放比例
+        // 屏幕大约是480x502，我们希望图片能适应屏幕
+        if (img_info.width > 960 || img_info.height > 1000) {
+            jpeg_cfg.out_scale = JPEG_IMAGE_SCALE_1_4;  // 缩放到1/4
+            ESP_LOGI("CustomLcdDisplay", "Using 1/4 scale for large image");
+        } else if (img_info.width > 480 || img_info.height > 500) {
+            jpeg_cfg.out_scale = JPEG_IMAGE_SCALE_1_2;  // 缩放到1/2
+            ESP_LOGI("CustomLcdDisplay", "Using 1/2 scale for medium image");
+        } else {
+            jpeg_cfg.out_scale = JPEG_IMAGE_SCALE_0;    // 不缩放
+            ESP_LOGI("CustomLcdDisplay", "No scaling for small image");
+        }
+        
+        // 重新获取缩放后的尺寸
+        ret = esp_jpeg_get_image_info(&jpeg_cfg, &img_info);
+        if (ret != ESP_OK) {
+            ESP_LOGE("CustomLcdDisplay", "Failed to get scaled JPEG info");
+            free(jpeg_data);
+            ShowNotification("解析图片失败", 3000);
+            return;
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "Scaled image size: %dx%d, output_len: %d bytes", 
+                 img_info.width, img_info.height, img_info.output_len);
+        
+        // 分配输出缓冲区
+        image_buffer_ = (uint8_t*)heap_caps_malloc(img_info.output_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!image_buffer_) {
+            image_buffer_ = (uint8_t*)malloc(img_info.output_len);
+            if (!image_buffer_) {
+                ESP_LOGE("CustomLcdDisplay", "Failed to allocate output buffer (%d bytes)", img_info.output_len);
+                free(jpeg_data);
+                ShowNotification("内存不足", 3000);
+                return;
+            }
+        }
+        
+        // 设置输出缓冲区并解码
+        jpeg_cfg.outbuf = image_buffer_;
+        jpeg_cfg.outbuf_size = img_info.output_len;
+        jpeg_cfg.flags.swap_color_bytes = 0;  // RGB565不需要交换字节
+        
+        ESP_LOGI("CustomLcdDisplay", "Starting JPEG decode...");
+        ret = esp_jpeg_decode(&jpeg_cfg, &img_info);
+        
+        // 释放JPEG数据缓冲区
+        free(jpeg_data);
+        
+        if (ret != ESP_OK) {
+            ESP_LOGE("CustomLcdDisplay", "JPEG decode failed: %s", esp_err_to_name(ret));
+            free(image_buffer_);
+            image_buffer_ = nullptr;
+            ShowNotification("解码图片失败", 3000);
+            return;
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "JPEG decode successful! Image: %dx%d", img_info.width, img_info.height);
+        
+        image_width_ = img_info.width;
+        image_height_ = img_info.height;
+        
+        // 创建LVGL图片对象
+        sd_image_ = lv_img_create(container_);
+        
+        // 创建LVGL图片描述符
+        static lv_img_dsc_t img_dsc;
+        img_dsc.header.reserved_2 = 0;
+        img_dsc.header.w = image_width_;
+        img_dsc.header.h = image_height_;
+        img_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        img_dsc.data_size = img_info.output_len;
+        img_dsc.data = image_buffer_;
+        
+        lv_img_set_src(sd_image_, &img_dsc);
+        
+        // 如果图片太大，允许滚动
+        if (image_width_ > LV_HOR_RES || image_height_ > LV_VER_RES - 100) {
+            // 创建一个可滚动的容器
+            lv_obj_set_size(sd_image_, image_width_, image_height_);
+            lv_obj_align(sd_image_, LV_ALIGN_TOP_MID, 0, 60);  // 留出状态栏空间
+            lv_obj_set_scrollbar_mode(container_, LV_SCROLLBAR_MODE_AUTO);
+            ESP_LOGI("CustomLcdDisplay", "Image is larger than screen, scrolling enabled");
+        } else {
+            // 居中显示图片
+            lv_obj_align(sd_image_, LV_ALIGN_CENTER, 0, -30);
+            ESP_LOGI("CustomLcdDisplay", "Image fits on screen, centered display");
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "Image displayed successfully!");
+    }
+    bool InitializeSDCard() {
+        if (sd_initialized_) {
+            return true;
+        }
+        
+        esp_err_t ret;
+        const char mount_point[] = "/sdcard";
+        
+        ESP_LOGI("CustomLcdDisplay", "=== SD Card Initialization Start ===");
+        ESP_LOGI("CustomLcdDisplay", "Using pins - MOSI:%d, MISO:%d, SCK:%d, CS:%d", 
+                 SD_MOSI_PIN, SD_MISO_PIN, SD_SCK_PIN, SD_CS_PIN);
+        
+        // 首先复位GPIO状态
+        gpio_reset_pin(SD_MOSI_PIN);
+        gpio_reset_pin(SD_MISO_PIN);
+        gpio_reset_pin(SD_SCK_PIN);
+        gpio_reset_pin(SD_CS_PIN);
+        
+        // 配置CS引脚为输出，初始为高电平（重要！）
+        gpio_set_direction(SD_CS_PIN, GPIO_MODE_OUTPUT);
+        gpio_set_pull_mode(SD_CS_PIN, GPIO_PULLUP_ONLY);
+        gpio_set_level(SD_CS_PIN, 1);
+        
+        // 配置其他引脚的上拉（SD卡需要）
+        gpio_set_pull_mode(SD_MOSI_PIN, GPIO_PULLUP_ONLY);
+        gpio_set_pull_mode(SD_MISO_PIN, GPIO_PULLUP_ONLY);
+        gpio_set_pull_mode(SD_SCK_PIN, GPIO_PULLUP_ONLY);
+        
+        // 等待电源稳定
+        vTaskDelay(pdMS_TO_TICKS(200));
+        
+        // SD卡挂载配置
+        esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+            .format_if_mount_failed = false,
+            .max_files = 5,
+            .allocation_unit_size = 0,  // 0 = 自动选择
+            .disk_status_check_enable = false
+        };
+        
+        // 检查并初始化SPI总线
+        static bool spi_bus_initialized = false;
+        if (!spi_bus_initialized) {
+            ESP_LOGI("CustomLcdDisplay", "Initializing SPI bus for SD card...");
+            
+            spi_bus_config_t bus_cfg = {
+                .mosi_io_num = SD_MOSI_PIN,
+                .miso_io_num = SD_MISO_PIN,
+                .sclk_io_num = SD_SCK_PIN,
+                .quadwp_io_num = GPIO_NUM_NC,
+                .quadhd_io_num = GPIO_NUM_NC,
+                .max_transfer_sz = 4000,
+                .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS,
+                .intr_flags = 0
+            };
+            
+            // 尝试初始化SPI3总线
+            ret = spi_bus_initialize(SPI3_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+            if (ret == ESP_ERR_INVALID_STATE) {
+                ESP_LOGW("CustomLcdDisplay", "SPI bus already initialized");
+            } else if (ret != ESP_OK) {
+                ESP_LOGE("CustomLcdDisplay", "Failed to initialize SPI bus: %s (0x%x)", esp_err_to_name(ret), ret);
+                return false;
+            }
+            spi_bus_initialized = true;
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "Configuring SD card host...");
+        
+        // SD卡主机配置
+        sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+        host.slot = SPI3_HOST;
+        host.max_freq_khz = 400;  // 使用400kHz初始化（标准SD卡初始化速度）
+        host.flags = SDMMC_HOST_FLAG_SPI | SDMMC_HOST_FLAG_DEINIT_ARG;
+        
+        // SD卡SPI设备配置
+        sdspi_device_config_t slot_config = {};
+        slot_config.gpio_cs = SD_CS_PIN;
+        slot_config.host_id = SPI3_HOST;
+        slot_config.gpio_cd = GPIO_NUM_NC;  // 不使用卡检测引脚
+        slot_config.gpio_wp = GPIO_NUM_NC;  // 不使用写保护引脚
+        slot_config.gpio_int = GPIO_NUM_NC; // 不使用中断引脚
+        
+        ESP_LOGI("CustomLcdDisplay", "Attempting to mount SD card...");
+        
+        // 首次尝试挂载
+        ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_);
+        
+        if (ret != ESP_OK) {
+            ESP_LOGW("CustomLcdDisplay", "First mount attempt failed: %s (0x%x)", esp_err_to_name(ret), ret);
+            
+            // 如果失败，尝试手动初始化序列
+            ESP_LOGI("CustomLcdDisplay", "Attempting manual SD card initialization sequence...");
+            
+            // 发送至少74个时钟周期（SD卡规范要求）
+            gpio_set_level(SD_CS_PIN, 1);
+            for(int i = 0; i < 10; i++) {
+                gpio_set_level(SD_SCK_PIN, 0);
+                esp_rom_delay_us(10);
+                gpio_set_level(SD_SCK_PIN, 1);
+                esp_rom_delay_us(10);
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            
+            // 再次尝试挂载，使用更低速度
+            host.max_freq_khz = 200;  // 200kHz重试
+            ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_);
+            
+            if (ret != ESP_OK) {
+                ESP_LOGW("CustomLcdDisplay", "Second attempt failed, trying 100kHz...");
+                host.max_freq_khz = 100;  // 100kHz最后尝试
+                ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &sd_card_);
+            }
+        }
+        
+        if (ret == ESP_OK) {
+            ESP_LOGI("CustomLcdDisplay", "SD card mount SUCCESS!");
+        }
+        
+        if (ret != ESP_OK) {
+            if (ret == ESP_FAIL) {
+                ESP_LOGE("CustomLcdDisplay", "Failed to mount filesystem. Make sure SD card is inserted properly.");
+            } else {
+                ESP_LOGE("CustomLcdDisplay", "Failed to initialize SD card: %s (0x%x)", esp_err_to_name(ret), ret);
+                if (ret == ESP_ERR_TIMEOUT) {
+                    ESP_LOGE("CustomLcdDisplay", "SD card initialization timeout. Check card and connections.");
+                } else if (ret == ESP_ERR_NOT_FOUND) {
+                    ESP_LOGE("CustomLcdDisplay", "SD card not detected. Check if card is inserted and CS pin connection.");
+                }
+            }
+            // 不要释放SPI总线，因为可能会被其他设备使用
+            return false;
+        }
+        
+        // 打印SD卡信息
+        sdmmc_card_print_info(stdout, sd_card_);
+        
+        // 成功挂载后，逐步提高速度
+        ESP_LOGI("CustomLcdDisplay", "SD card mounted successfully, gradually increasing speed...");
+        
+        // 先尝试1MHz
+        sd_card_->max_freq_khz = 1000;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        // 测试读取根目录
+        DIR* test_dir = opendir(mount_point);
+        if (test_dir) {
+            closedir(test_dir);
+            // 如果1MHz稳定，尝试提高到5MHz
+            sd_card_->max_freq_khz = 5000;
+            ESP_LOGI("CustomLcdDisplay", "SD card speed increased to 5MHz");
+        } else {
+            ESP_LOGW("CustomLcdDisplay", "Keeping SD card at low speed for stability");
+        }
+        
+        sd_initialized_ = true;
+        return true;
+    }
+    
+    void DisplaySDCardImage() {
+        ESP_LOGI("CustomLcdDisplay", "Displaying SD card image...");
+        
+        // 尝试初始化SD卡
+        if (!InitializeSDCard()) {
+            ShowNotification("SD卡初始化失败,请确保已格式化为FAT32", 5000);
+            ESP_LOGW("CustomLcdDisplay", "Note: 64GB cards must be formatted as FAT32, not exFAT!");
+            ESP_LOGW("CustomLcdDisplay", "Use a tool like 'FAT32 Format' on Windows or 'Disk Utility' on Mac");
+            return;
+        }
+        
+        // 指定要显示的图片文件
+        const char* image_path = "/sdcard/_C3A8676.jpg";
+        
+        // 检查文件是否存在
+        struct stat file_stat;
+        if (stat(image_path, &file_stat) != 0) {
+            ESP_LOGE("CustomLcdDisplay", "Image file not found: %s", image_path);
+            ShowNotification("找不到图片: _C3A8676.jpg", 3000);
+            return;
+        }
+        
+        ESP_LOGI("CustomLcdDisplay", "Found image file, size: %ld bytes", (long)file_stat.st_size);
+        
+        // 读取并解码JPEG文件显示缩略图
+        ESP_LOGI("CustomLcdDisplay", "Loading and decoding JPEG file: %s (%.2f MB)", 
+                 image_path, file_stat.st_size / (1024.0 * 1024.0));
+        
+        // 显示真实的JPEG图片缩略图
+        DisplayJpegFile(image_path);
+        
+        ESP_LOGI("CustomLcdDisplay", "Image displayed successfully");
+        ShowNotification("图片显示成功", 2000);
+    }
+    
 public:
     static void rounder_event_cb(lv_event_t* e) {
         lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
@@ -123,6 +525,23 @@ public:
         lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.15, 0); // 增加到15%避免圆角遮挡
         lv_obj_set_style_pad_top(status_bar_, 20, 0);  // 添加顶部边距让状态栏往下移
         lv_obj_set_size(status_bar_, LV_HOR_RES, fonts_.text_font->line_height + 15); // 增加状态栏高度
+        
+        // 创建SD卡按钮
+        // 注释掉原来的SD卡按钮，因为现在通过MCP控制
+        // sd_button_ = lv_btn_create(container_);
+        // lv_obj_set_size(sd_button_, LV_HOR_RES * 0.6, 50);
+        // lv_obj_align(sd_button_, LV_ALIGN_BOTTOM_MID, 0, -30);
+        // lv_obj_set_style_bg_color(sd_button_, lv_color_hex(0x2196F3), 0);
+        // lv_obj_set_style_radius(sd_button_, 10, 0);
+        // 
+        // lv_obj_t* label = lv_label_create(sd_button_);
+        // lv_label_set_text(label, "显示SD卡图片");
+        // lv_obj_set_style_text_font(label, fonts_.text_font, 0);
+        // lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+        // lv_obj_center(label);
+        // 
+        // lv_obj_add_event_cb(sd_button_, sd_button_event_cb, LV_EVENT_CLICKED, this);
+        
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
     }
 };
@@ -156,7 +575,8 @@ private:
     PowerSaveTimer* power_save_timer_;
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // 临时禁用电源管理定时器，防止自动关机
+        power_save_timer_ = new PowerSaveTimer(-1, -1, -1);  // 设置所有定时器为-1（禁用）
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(20); });
@@ -165,7 +585,7 @@ private:
             GetBacklight()->RestoreBrightness(); });
         power_save_timer_->OnShutdownRequest([this](){ 
             pmic_->PowerOff(); });
-        power_save_timer_->SetEnabled(true);
+        power_save_timer_->SetEnabled(false);  // 禁用电源管理定时器
     }
 
     void InitializeCodecI2c() {
@@ -251,12 +671,225 @@ private:
         esp_lcd_panel_invert_color(panel, false);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         esp_lcd_panel_disp_on_off(panel, true);
+        // SH8601不支持swap_xy，所以传false
         display_ = new CustomLcdDisplay(panel_io, panel,
-                                        DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+                                        DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, false);
         backlight_ = new CustomBacklight(panel_io);
         backlight_->RestoreBrightness();
     }
 
+    // SD卡MCP工具实现
+    std::string ListSDCardFiles(const std::string& path) {
+        if (!display_->InitializeSDCard()) {
+            return "{\"success\": false, \"error\": \"SD card not initialized\"}";
+        }
+        
+        DIR* dir = opendir(path.c_str());
+        if (!dir) {
+            return "{\"success\": false, \"error\": \"Failed to open directory\"}";
+        }
+        
+        cJSON* result = cJSON_CreateObject();
+        cJSON_AddBoolToObject(result, "success", true);
+        cJSON_AddStringToObject(result, "path", path.c_str());
+        
+        cJSON* files_array = cJSON_CreateArray();
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            cJSON* file_obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(file_obj, "name", entry->d_name);
+            
+            // 获取文件信息
+            std::string full_path = path + "/" + entry->d_name;
+            struct stat file_stat;
+            if (stat(full_path.c_str(), &file_stat) == 0) {
+                cJSON_AddBoolToObject(file_obj, "is_directory", S_ISDIR(file_stat.st_mode));
+                cJSON_AddNumberToObject(file_obj, "size", file_stat.st_size);
+                cJSON_AddNumberToObject(file_obj, "modified", file_stat.st_mtime);
+            }
+            
+            cJSON_AddItemToArray(files_array, file_obj);
+        }
+        closedir(dir);
+        
+        cJSON_AddItemToObject(result, "files", files_array);
+        
+        char* json_str = cJSON_PrintUnformatted(result);
+        std::string result_str(json_str);
+        cJSON_free(json_str);
+        cJSON_Delete(result);
+        
+        return result_str;
+    }
+    
+    std::string ReadSDCardFile(const std::string& filepath, int max_size) {
+        if (!display_->InitializeSDCard()) {
+            return "{\"success\": false, \"error\": \"SD card not initialized\"}";
+        }
+        
+        FILE* fp = fopen(filepath.c_str(), "r");
+        if (!fp) {
+            return "{\"success\": false, \"error\": \"Failed to open file\"}";
+        }
+        
+        // 获取文件大小
+        fseek(fp, 0, SEEK_END);
+        long file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        
+        // 限制读取大小
+        int read_size = (file_size > max_size) ? max_size : file_size;
+        
+        char* buffer = (char*)malloc(read_size + 1);
+        if (!buffer) {
+            fclose(fp);
+            return "{\"success\": false, \"error\": \"Memory allocation failed\"}";
+        }
+        
+        size_t bytes_read = fread(buffer, 1, read_size, fp);
+        buffer[bytes_read] = '\0';
+        fclose(fp);
+        
+        cJSON* result = cJSON_CreateObject();
+        cJSON_AddBoolToObject(result, "success", true);
+        cJSON_AddStringToObject(result, "filepath", filepath.c_str());
+        cJSON_AddNumberToObject(result, "size", file_size);
+        cJSON_AddNumberToObject(result, "bytes_read", bytes_read);
+        cJSON_AddStringToObject(result, "content", buffer);
+        
+        free(buffer);
+        
+        char* json_str = cJSON_PrintUnformatted(result);
+        std::string result_str(json_str);
+        cJSON_free(json_str);
+        cJSON_Delete(result);
+        
+        return result_str;
+    }
+    
+    std::string WriteSDCardFile(const std::string& filepath, const std::string& content, bool append) {
+        if (!display_->InitializeSDCard()) {
+            return "{\"success\": false, \"error\": \"SD card not initialized\"}";
+        }
+        
+        FILE* fp = fopen(filepath.c_str(), append ? "a" : "w");
+        if (!fp) {
+            return "{\"success\": false, \"error\": \"Failed to open file for writing\"}";
+        }
+        
+        size_t bytes_written = fwrite(content.c_str(), 1, content.length(), fp);
+        fclose(fp);
+        
+        cJSON* result = cJSON_CreateObject();
+        cJSON_AddBoolToObject(result, "success", true);
+        cJSON_AddStringToObject(result, "filepath", filepath.c_str());
+        cJSON_AddNumberToObject(result, "bytes_written", bytes_written);
+        
+        char* json_str = cJSON_PrintUnformatted(result);
+        std::string result_str(json_str);
+        cJSON_free(json_str);
+        cJSON_Delete(result);
+        
+        return result_str;
+    }
+    
+    std::string DeleteSDCardFile(const std::string& path) {
+        if (!display_->InitializeSDCard()) {
+            return "{\"success\": false, \"error\": \"SD card not initialized\"}";
+        }
+        
+        struct stat file_stat;
+        if (stat(path.c_str(), &file_stat) != 0) {
+            return "{\"success\": false, \"error\": \"File or directory not found\"}";
+        }
+        
+        int result;
+        if (S_ISDIR(file_stat.st_mode)) {
+            result = rmdir(path.c_str());
+        } else {
+            result = unlink(path.c_str());
+        }
+        
+        if (result == 0) {
+            return "{\"success\": true, \"message\": \"File deleted successfully\"}";
+        } else {
+            return "{\"success\": false, \"error\": \"Failed to delete file\"}";
+        }
+    }
+    
+    std::string GetSDCardInfo() {
+        if (!display_->InitializeSDCard()) {
+            return "{\"success\": false, \"error\": \"SD card not initialized\"}";
+        }
+        
+        // 获取SD卡信息
+        FATFS* fs;
+        DWORD fre_clust, fre_sect, tot_sect;
+        
+        if (f_getfree("/sdcard", &fre_clust, &fs) != FR_OK) {
+            return "{\"success\": false, \"error\": \"Failed to get SD card info\"}";
+        }
+        
+        tot_sect = (fs->n_fatent - 2) * fs->csize;
+        fre_sect = fre_clust * fs->csize;
+        
+        uint64_t total_bytes = (uint64_t)tot_sect * 512;
+        uint64_t free_bytes = (uint64_t)fre_sect * 512;
+        uint64_t used_bytes = total_bytes - free_bytes;
+        
+        cJSON* result = cJSON_CreateObject();
+        cJSON_AddBoolToObject(result, "success", true);
+        cJSON_AddNumberToObject(result, "total_bytes", total_bytes);
+        cJSON_AddNumberToObject(result, "free_bytes", free_bytes);
+        cJSON_AddNumberToObject(result, "used_bytes", used_bytes);
+        cJSON_AddNumberToObject(result, "total_mb", total_bytes / (1024 * 1024));
+        cJSON_AddNumberToObject(result, "free_mb", free_bytes / (1024 * 1024));
+        cJSON_AddNumberToObject(result, "used_mb", used_bytes / (1024 * 1024));
+        
+        // 获取SD卡类型信息
+        if (display_->sd_card_ != nullptr) {
+            cJSON_AddStringToObject(result, "name", display_->sd_card_->cid.name);
+            cJSON_AddNumberToObject(result, "capacity_mb", display_->sd_card_->csd.capacity / 2048);
+            cJSON_AddBoolToObject(result, "is_mmc", display_->sd_card_->is_mmc);
+            cJSON_AddBoolToObject(result, "is_sdio", display_->sd_card_->is_sdio);
+        }
+        
+        char* json_str = cJSON_PrintUnformatted(result);
+        std::string result_str(json_str);
+        cJSON_free(json_str);
+        cJSON_Delete(result);
+        
+        return result_str;
+    }
+    
+    std::string DisplaySDCardImageFile(const std::string& filepath) {
+        if (!display_->InitializeSDCard()) {
+            return "{\"success\": false, \"error\": \"SD card not initialized\"}";
+        }
+        
+        // 检查文件是否存在
+        struct stat file_stat;
+        if (stat(filepath.c_str(), &file_stat) != 0) {
+            return "{\"success\": false, \"error\": \"Image file not found\"}";
+        }
+        
+        // 调用显示图片的函数
+        display_->DisplayJpegFile(filepath.c_str());
+        
+        cJSON* result = cJSON_CreateObject();
+        cJSON_AddBoolToObject(result, "success", true);
+        cJSON_AddStringToObject(result, "message", "Image displayed successfully");
+        cJSON_AddStringToObject(result, "filepath", filepath.c_str());
+        cJSON_AddNumberToObject(result, "size", file_stat.st_size);
+        
+        char* json_str = cJSON_PrintUnformatted(result);
+        std::string result_str(json_str);
+        cJSON_free(json_str);
+        cJSON_Delete(result);
+        
+        return result_str;
+    }
+    
     void InitializeTouch() {
         esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
@@ -297,6 +930,90 @@ private:
             PropertyList(), [this](const PropertyList& properties) {
                 ResetWifiConfiguration();
                 return true;
+            });
+        
+        // 添加SD卡相关的MCP工具
+        mcp_server.AddTool("self.sdcard.list_files",
+            "List files and directories in the SD card.\n"
+            "Args:\n"
+            "  `path`: The directory path to list (default: /sdcard)\n"
+            "Return:\n"
+            "  A JSON object containing the list of files and directories.",
+            PropertyList({
+                Property("path", kPropertyTypeString, "/sdcard")
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return ListSDCardFiles(properties["path"].value<std::string>());
+            });
+        
+        mcp_server.AddTool("self.sdcard.read_file",
+            "Read the content of a text file from the SD card.\n"
+            "Args:\n"
+            "  `filepath`: The full path of the file to read\n"
+            "  `max_size`: Maximum bytes to read (default: 4096)\n"
+            "Return:\n"
+            "  The content of the file as a string.",
+            PropertyList({
+                Property("filepath", kPropertyTypeString),
+                Property("max_size", kPropertyTypeInteger, 4096, 1, 102400)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return ReadSDCardFile(properties["filepath"].value<std::string>(),
+                                     properties["max_size"].value<int>());
+            });
+        
+        mcp_server.AddTool("self.sdcard.write_file",
+            "Write content to a file on the SD card.\n"
+            "Args:\n"
+            "  `filepath`: The full path of the file to write\n"
+            "  `content`: The content to write to the file\n"
+            "  `append`: Whether to append to existing file (default: false)\n"
+            "Return:\n"
+            "  Success status message.",
+            PropertyList({
+                Property("filepath", kPropertyTypeString),
+                Property("content", kPropertyTypeString),
+                Property("append", kPropertyTypeBoolean, false)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return WriteSDCardFile(properties["filepath"].value<std::string>(),
+                                      properties["content"].value<std::string>(),
+                                      properties["append"].value<bool>());
+            });
+        
+        mcp_server.AddTool("self.sdcard.delete_file",
+            "Delete a file or empty directory from the SD card.\n"
+            "Args:\n"
+            "  `path`: The full path of the file or directory to delete\n"
+            "Return:\n"
+            "  Success status message.",
+            PropertyList({
+                Property("path", kPropertyTypeString)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return DeleteSDCardFile(properties["path"].value<std::string>());
+            });
+        
+        mcp_server.AddTool("self.sdcard.get_info",
+            "Get SD card information including capacity and usage.\n"
+            "Return:\n"
+            "  A JSON object containing SD card information.",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return GetSDCardInfo();
+            });
+        
+        mcp_server.AddTool("self.sdcard.display_image",
+            "Display an image file from the SD card on the screen.\n"
+            "Args:\n"
+            "  `filepath`: The full path of the image file (JPEG)\n"
+            "Return:\n"
+            "  Success status message.",
+            PropertyList({
+                Property("filepath", kPropertyTypeString)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return DisplaySDCardImageFile(properties["filepath"].value<std::string>());
             });
     }
 
@@ -343,7 +1060,8 @@ public:
         discharging = pmic_->IsDischarging();
         if (discharging != last_discharging)
         {
-            power_save_timer_->SetEnabled(discharging);
+            // 临时禁用：即使在电池供电模式下也不启用电源管理
+            // power_save_timer_->SetEnabled(discharging);
             last_discharging = discharging;
         }
 

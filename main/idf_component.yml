@@ -36,6 +36,7 @@ dependencies:
   espressif/esp_mmap_assets: '>=1.2'
   txp666/otto-emoji-gif-component: ~1.0.2
   espressif/adc_battery_estimation: ^0.2.0
+  espressif/esp_jpeg: ^1.0.5
 
   # SenseCAP Watcher Board
   wvirgil123/sscma_client:
