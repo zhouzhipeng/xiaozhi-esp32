@@ -46,8 +46,8 @@
 
 #define TAG "WaveshareEsp32s3TouchAMOLED2inch06"
 
-LV_FONT_DECLARE(font_puhui_20_4);  // 使用更小的字体以节省内存
-LV_FONT_DECLARE(font_awesome_20_4);
+LV_FONT_DECLARE(font_puhui_30_4);
+LV_FONT_DECLARE(font_awesome_30_4);
 
 class Pmic : public Axp2101 {
 public:
@@ -805,8 +805,8 @@ public:
         : SpiLcdDisplay(io_handle, panel_handle,
                         width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy,
                         {
-                            .text_font = &font_puhui_20_4,  // 使用更小的字体
-                            .icon_font = &font_awesome_20_4,
+                            .text_font = &font_puhui_30_4,
+                            .icon_font = &font_awesome_30_4,
 #if CONFIG_USE_WECHAT_MESSAGE_STYLE
                             .emoji_font = font_emoji_32_init(),
 #else
